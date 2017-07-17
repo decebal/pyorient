@@ -1,6 +1,6 @@
 from .operators import (Operator, IdentityOperand, Operand,
                         ArithmeticOperation, LogicalConnective)
-from pyorient.ogm.what import What, FunctionWhat, ChainableWhat, LetVariable
+from pyorient.ogm.what import What, FunctionWhat, ChainableWhat, LetVariable, QT
 from pyorient.ogm.property import Property, PropertyEncoder
 from pyorient.ogm.query_utils import ArgConverter
 
@@ -268,10 +268,11 @@ class ExpressionMixin(object):
                         cls.arithmetic_string(left)
                         , cls.arithmetic_string(right))
 
-            return '{}{}{}'.format(lp,exp,rp)
+            return lp+exp+rp
         elif isinstance(operation_root, Property):
             return operation_root.context_name()
-        elif isinstance(operation_root, LetVariable):
+        elif isinstance(operation_root, LetVariable) or isinstance(operation_root, QT):
+            # TODO This condition suggests common base for variables and tokens, below What
             return cls.build_what(operation_root)
         else:
             return operation_root
@@ -343,7 +344,7 @@ class ExpressionMixin(object):
             if prop_names is not None:
                 prop_names.append(
                     cls.parse_prop_name(chain[0], name_override))
-            return '{}{}'.format('.'.join(chain), as_str)
+            return '.'.join(chain) + as_str
         else:
             # For now, can assume it's a Token
             return '{{{}}}'.format(what.token) if what.token is not None else '{}'

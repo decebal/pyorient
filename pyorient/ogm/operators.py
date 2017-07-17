@@ -131,6 +131,8 @@ class ArithmeticMixin(object):
         return ArithmeticOperation(Operator.Div, (left, self))
     def __truediv__(self, other): # Python 3.x
         return ArithmeticOperation(Operator.Div, (self, other))
+    def __rtruediv__(self, left): # Python 3.x
+        return ArithmeticOperation(Operator.Div, (left, self))
 
     def __mod__(self, other):
         return ArithmeticOperation(Operator.Mod, (self, other))
@@ -156,7 +158,7 @@ class ArithmeticOperation(ArithmeticMixin, RelativeOperand):
 class InstanceOfMixin(object):
     @classmethod
     def instanceof(cls, left, right=None):
-        if cls is InstanceOf:
+        if cls is InstanceOfMixin:
             return LogicalConnective(Operator.InstanceOf, (left, right))
         else: # Subclass
             return LogicalConnective(Operator.InstanceOf, (cls, left))

@@ -74,6 +74,8 @@ class OGMAnimalsTestCaseBase(unittest.TestCase):
         g = self.g
 
         rat = g.animals.create(name='rat', specie='rodent')
+        self.assertEqual(rat.context, g)
+
         mouse = g.animals.create(name='mouse', specie='rodent')
         queried_rat = g.query(Animal).filter(
             Animal.name.endswith('at') | (Animal.name == 'tiger')).one()
@@ -327,8 +329,11 @@ class OGMMoneyTestCase(unittest.TestCase):
 
         # Django-style creation
         costanzo_claim = Carries.objects.create(costanzo, inheritance)
-        valerius_claim = Carries.objects.create(valerius, inheritance)
-        oliver_carries = Carries.objects.create(oliver, poor_pouch)
+
+        # Syntactic sugar shorthand, via edge class
+        valerius_claim = valerius(Carries)>inheritance
+        # ... or via edge class broker
+        oliver_carries = oliver(Carries.objects)>poor_pouch
 
         g.scripts.add(GroovyScripts.from_file(
             os.path.join(
@@ -407,6 +412,78 @@ class OGMClassTestCase(unittest.TestCase):
             pass
         else:
             assert False and 'Failed to enforce correct vertex base classes.'
+
+class OGMSplitPropertyCase(unittest.TestCase):
+    def __init__(self, *args, **kwargs):
+        super(OGMSplitPropertyCase, self).__init__(*args, **kwargs)
+        self.g = None
+
+    def setUp(self):
+        g = self.g = Graph(Config.from_url('ogm_split_prop', 'root', 'root'
+                                           , initial_drop=True))
+
+    def testSplit(self):
+        g = self.g
+
+        Node = declarative_node()
+        with self.assertRaises(ValueError):
+            class A(Node):
+                element_plural = 'ayes'
+            class B(Node):
+                element_plural = 'bees'
+            split_prop = String(nullable=False)
+            A.prop = split_prop
+            B.prop = split_prop
+
+class OGMArithmeticCase(unittest.TestCase):
+    def __init__(self, *args, **kwargs):
+        super(OGMArithmeticCase, self).__init__(*args, **kwargs)
+
+    def setUp(self):
+        pass
+
+    def testArithmetic(self):
+        from pyorient.ogm.expressions import ExpressionMixin
+        expr = ExpressionMixin()
+        dval = Double(name='dval')
+
+        add = dval + 1.0
+        self.assertEqual(expr.arithmetic_string(add), 'dval + 1.0')
+
+        add_paren = (dval + 1.0)[:]
+        self.assertEqual(expr.arithmetic_string(add_paren), '(dval + 1.0)')
+
+        var_add = dval + QV('var')
+        self.assertEqual(expr.arithmetic_string(var_add), 'dval + $var')
+
+        token_add = dval + QT()
+        self.assertEqual(expr.arithmetic_string(token_add), 'dval + {}')
+
+        radd = 1.0 + dval
+        self.assertEqual(expr.arithmetic_string(radd), '1.0 + dval')
+
+        sub = dval - 1.0
+        self.assertEqual(expr.arithmetic_string(sub), 'dval - 1.0')
+        rsub = 1.0 - dval
+        self.assertEqual(expr.arithmetic_string(rsub), '1.0 - dval')
+
+        mul = dval * 1.0
+        self.assertEqual(expr.arithmetic_string(mul), 'dval * 1.0')
+        rmul = 1.0 * dval
+        self.assertEqual(expr.arithmetic_string(rmul), '1.0 * dval')
+
+        div = dval / 1.0
+        self.assertEqual(expr.arithmetic_string(div), 'dval / 1.0')
+        rdiv = 1.0 / dval
+        self.assertEqual(expr.arithmetic_string(rdiv), '1.0 / dval')
+
+        ival = Integer(name='ival')
+
+        odd = ival % 2
+        self.assertEqual(expr.arithmetic_string(odd), 'ival % 2')
+
+        rodd = 2 % ival
+        self.assertEqual(expr.arithmetic_string(rodd), '2 % ival')
 
 
 DateTimeNode = declarative_node()
@@ -646,9 +723,10 @@ class OGMEmbeddedDefaultsTestCase(unittest.TestCase):
 
         # On the next load, the node should have:
         # 'info' = [{'normal': False}]
-        node = g.DefaultEmbeddedNode.query().one()
-        self.assertIn('normal', node.info[0])
-        self.assertIs(node.info[0]['normal'], False)
+        node_queried = g.DefaultEmbeddedNode.query().one()
+        self.assertNotEqual(node, node_queried)
+        self.assertIn('normal', node_queried.info[0])
+        self.assertIs(node_queried.info[0]['normal'], False)
 
 
 if sys.version_info[0] < 3:
@@ -977,6 +1055,7 @@ class OGMTestSequences(unittest.TestCase):
         # Default start value is 0, so first call to next() gives 1
         # Want it to be 2
         seq = self.sequences.create('mycounter', Sequence.Ordered, start=1)
+        self.assertIn('mycounter', self.sequences)
         create_third = g.batch()
         create_third[:] = create_third.items.create(id=seq.next(), qty=30, price=2500)
         create_third.commit()
@@ -999,6 +1078,8 @@ class OGMTestSequences(unittest.TestCase):
             #id = Long(nullable=False, unique=True, default=sequence('item_ids').next())
             id = Long(nullable=False, unique=True)
         g.create_class(SequencedItem)
+
+        self.assertIn('item_ids', self.sequences)
 
         batch_create = g.batch()
         # Would be nice to use default value, but see NOTE above
@@ -1069,11 +1150,41 @@ class OGMTestTraversals(unittest.TestCase):
         b['leo'] = b.leos.create()
         b[:] = b[:'leo'](OGMTestTraversals.OnTopOf)>b[:'don']
         b[:] = g.update_edge(b[:'top']).set((OGMTestTraversals.LIFO.in_, b[:'leo']))
-        b['traversal'] = g.traverse(b[:'tgt'], in_(OGMTestTraversals.OnTopOf)).query().filter(QV.depth() > 0)
+
+        traverse = g.traverse(QT(), in_(OGMTestTraversals.OnTopOf))
+
+        b['traversal'] = traverse.query().filter(QV.depth() > 0).format(b[:'tgt'])
         traversals = b['$traversal']
 
         print('{}s all the way down'.format(traversals[0].species()))
         self.assertEqual(len(traversals), 8)
+
+        from copy import deepcopy
+        duplicate_traverse = deepcopy(traverse)
+        formatted = duplicate_traverse.format(traversals[0])
+        second_traversal = formatted.all()
+        self.assertEqual(len(second_traversal), 8)
+
+        # Since the target of the formatted traversal is a token, can not
+        # expect a meaningful result recompiling in Traverse.all(). Create
+        # a new Traverse to test all() argument
+        new_traverse = g.traverse(second_traversal[0])
+        self.assertEqual(len(second_traversal),
+                         len(new_traverse.all(in_(OGMTestTraversals.OnTopOf))))
+
+        # Trigger warning with recompile
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            new_traverse.all(in_(OGMTestTraversals.OnTopOf))
+            self.assertEqual(len(w), 1)
+            self.assertTrue(issubclass(w[-1].category, RuntimeWarning))
+
+            # Trigger warning with attempted recompile without target
+            from pyorient.ogm.traverse import Traverse
+            from_str = Traverse.from_string(str(new_traverse), g)
+            from_str.all(in_(OGMTestTraversals.OnTopOf))
+            self.assertEqual(len(w), 2)
+            self.assertTrue(issubclass(w[-1].category, SyntaxWarning))
 
 class OGMFetchPlansCase(unittest.TestCase):
     Node = declarative_node()
@@ -1144,42 +1255,164 @@ class OGMLinkResolverCase(unittest.TestCase):
         element_plural = 'cees'
     C.bee = Link(linked_to=B, nullable=False)
 
-    def setUp(self):
-        g = self.g = Graph(Config.from_url('ogm_linkresolver', 'root', 'root'
-                                           , initial_drop=True)
-                           , decorate_properties=True)
+    class Appreciator(Node):
+        element_plural = 'appreciators'
+        name = String(nullable=False)
 
-        g.create_all(OGMLinkResolverCase.Node.registry)
+    class Book(Node):
+        element_plural = 'books'
+        title = String(nullable=False)
+        author = String(nullable=False)
+
+    class Film(Node):
+        element_plural = 'films'
+        name = String(nullable=False)
+        director = String(nullable=False)
+
+    Relationship = declarative_relationship()
+    class Borrowed(Relationship):
+        label = 'borrowed'
+
+    class Watched(Relationship):
+        label = 'watched'
+
+    def setUp(self):
+        from pyorient.ogm.mapping import Decorate, MapperConfig
+        self.props_decorated = \
+                Graph(Config.from_url('ogm_linkresolver_props', 'root', 'root'
+                                      , initial_drop=True)
+                      , decoration=Decorate.Properties)
+        # Alternative specification
+        mapper_conf = MapperConfig(decoration=Decorate.Elements)
+        self.elems_decorated = \
+                Graph(Config.from_url('ogm_linkresolver_elems', 'root', 'root'
+                                      , initial_drop=True)
+                      , None, None, mapper_conf)
+
+        for g in (self.props_decorated, self.elems_decorated):
+            g.create_all(OGMLinkResolverCase.Node.registry, OGMLinkResolverCase.Relationship.registry)
+
+            # Should compiled batches be usable across graphs?
+            # Seems more suited to tests than practical use.
+            b = g.batch()
+            b['a1'] = b.ayes.create(name='Foo')
+            b['a2'] = b.ayes.create(name='Bar')
+            # https://github.com/orientechnologies/orientdb/issues/7435
+            if g.server_version >= (2,2,21):
+                b['b'] = b.bees.create(ayes=[b[:'a1'], b[:'a2']])
+            else:
+                b['ayes'] = [b[:'a1'], b[:'a2']]
+                b['b'] = b.bees.create(ayes=b[:'ayes'])
+            b['c'] = b.cees.create(bee=b[:'b'])
+
+            b['karenina'] = b.books.create(title='Anna Karenina', author='Leo Tolstoy')
+            b['bovary'] = b.books.create(title='Madame Bovary', author='Gustave Flaubert')
+            b['finn'] = b.books.create(title='The Adventures of Huckleberry Finn', author='Mark Twain')
+            b['moby'] = b.books.create(title='Moby Dick', author='Herman Melville')
+
+            b['et'] = b.films.create(name='E.T.', director='Steven Spielberg')
+            b['titanic'] = b.films.create(name='Titanic', director='James Cameron')
+            b['future'] = b.films.create(name='Back to the Future', director='Robert Zemeckis')
+            b['godfather'] = b.films.create(name='The Godfather', director='Francis Ford Coppola')
+
+            b['alice'] = b.appreciators.create(name='Alice')
+            alice = b[:'alice']
+            b[:] = b.borrowed.create(alice, b[:'karenina'])
+            b[:] = b.borrowed.create(alice, b[:'finn'])
+            b[:] = b.borrowed.create(alice, b[:'moby'])
+            b[:] = b.watched.create(alice, b[:'et'])
+            b[:] = b.watched.create(alice, b[:'godfather'])
+            b['bob'] = b.appreciators.create(name='Bob')
+            bob = b[:'bob']
+            b[:] = b.borrowed.create(bob, b[:'bovary'])
+            b[:] = b.borrowed.create(bob, b[:'finn'])
+            b[:] = b.watched.create(bob, b[:'godfather'])
+            b[:] = b.watched.create(bob, b[:'titanic'])
+            b[:] = b.watched.create(bob, b[:'future'])
+
+            b.commit()
 
     def testFetchPlans(self):
-        g = self.g
+        for g in (self.elems_decorated, self.props_decorated):
+            cache = {}
+            b = g.batch(cache=cache)
+            b['result'] = b.cees.query().fetch_plan('*:-1')
+            c = b['$result']
 
-        cache = {}
-        b = g.batch(cache=cache)
-        b['a1'] = b.ayes.create(name='Foo')
-        b['a2'] = b.ayes.create(name='Bar')
-        # https://github.com/orientechnologies/orientdb/issues/7435
-        if g.server_version >= (2,2,21):
-            b['b'] = b.bees.create(ayes=[b[:'a1'], b[:'a2']])
-        else:
-            b['ayes'] = [b[:'a1'], b[:'a2']]
-            b['b'] = b.bees.create(ayes=b[:'ayes'])
-        b['c'] = b.cees.create(bee=b[:'b'])
+            self.assertEqual(len(c), 1)
 
-        b['result'] = b.cees.query().fetch_plan('*:-1')
-        c = b['$result']
+            # 2.2.9 doesn't trigger cache callback... ignore
+            # TODO Determine range of non-working versions
+            if g.server_version != (2,2,9):
+                if g == self.elems_decorated:
+                    # C (and B) handle link resolution
+                    self.assertIsInstance(c[0].bee, OGMLinkResolverCase.B)
+                else:
+                    # Link handles its own resolving
+                    self.assertNotIsInstance(c[0].bee, OGMLinkResolverCase.B)
 
-        self.assertEqual(len(c), 1)
+                ayes = c[0].bee.ayes
+                # A custom collection that resolves contained links
+                self.assertNotIsInstance(ayes, list)
+                self.assertEqual(len(ayes), 2)
+                self.assertEqual(ayes[0].name, 'Foo')
+                self.assertEqual(ayes[1].name, 'Bar')
+                for a in ayes:
+                    print(a.name)
 
-        # 2.2.9 doesn't trigger cache callback... ignore
-        # TODO Determine range of non-working versions
-        if g.server_version != (2,2,9):
-            ayes = c[0].bee.ayes
-            self.assertEqual(len(ayes), 2)
-            self.assertEqual(ayes[0].name, 'Foo')
-            self.assertEqual(ayes[1].name, 'Bar')
-            for a in ayes:
-                print(a.name)
+                # Query will by default - unless response_options() is passed
+                # resolve_projections=False - resolve (one level of) links
+                # automatically, returning the elements to which they point.
+                #
+                # This is different from Batches, which return elements
+                # containing unresolved links.
+                #
+                # With the appropriate fetch plan and element/property decoration
+                # (see MapperConfig), both approaches can achieve much the same
+                # effect.
+                appreciators_query = g.appreciators.query().what(QV.current().as_('person'), out('borrowed').as_('borrowed'), out('watched').as_('watched')).fetch_plan('*:1', cache).order_by(OGMLinkResolverCase.Appreciator.name)
+                appreciators = appreciators_query.all()
+
+                self.assertIsInstance(appreciators[0].person, OGMLinkResolverCase.Appreciator)
+
+                self.assertEqual(len(appreciators), 2)
+                alice = appreciators[0].person
+                self.assertEqual(alice.name, 'Alice')
+                alice_borrowed = [bk.title for bk in appreciators[0].borrowed]
+                self.assertEqual(len(alice_borrowed), 3)
+                self.assertIn('Anna Karenina', alice_borrowed)
+                self.assertIn('The Adventures of Huckleberry Finn', alice_borrowed)
+                self.assertIn('Moby Dick', alice_borrowed)
+                alice_watched = [f.name for f in appreciators[0].watched]
+                self.assertEqual(len(alice_watched), 2)
+                self.assertIn('E.T.', alice_watched)
+                self.assertIn('The Godfather', alice_watched)
+
+                bob = appreciators[1].person
+                bob_borrowed = [bk.author for bk in appreciators[1].borrowed]
+                self.assertEqual(len(bob_borrowed), 2)
+                self.assertIn('Gustave Flaubert', bob_borrowed)
+                self.assertIn('Mark Twain', bob_borrowed)
+                bob_watched = [f.director for f in appreciators[1].watched]
+                self.assertEqual(len(bob_watched), 3)
+                self.assertIn('Francis Ford Coppola', bob_watched)
+                self.assertIn('James Cameron', bob_watched)
+                self.assertIn('Robert Zemeckis', bob_watched)
+
+                # Fetch the unresolved (but variously decorated) links
+                b['result'] = appreciators_query
+                appreciators = b['$result']
+
+                # Dodge any link resolution to peek at actual type
+                person = dict.__getitem__(appreciators[0]._props, 'person')
+                if g == self.elems_decorated:
+                    from pyorient import OrientRecordLink
+                    self.assertIsInstance(person, OrientRecordLink)
+                else:
+                    # Decorated property that does its own resolving
+                    self.assertEqual(type(appreciators[0].person), type(person))
+
+                cache.clear()
 
 from pyorient.ogm.what import QT
 from pyorient.ogm.batch import BatchCompiler, CompiledBatch
