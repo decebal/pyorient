@@ -42,3 +42,4 @@ wiki
 *.zip
 cover
 env
+/.cache/
