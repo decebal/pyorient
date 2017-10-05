@@ -3,7 +3,7 @@ from .element import GraphElement
 from .exceptions import MultipleResultsFound, NoResultFound
 from .query_utils import ArgConverter
 from .commands import RetrievalCommand
-from .mapping import create_cache_callback
+from .mapping import CacheMixin
 
 from collections import namedtuple
 from keyword import iskeyword
@@ -11,14 +11,17 @@ from keyword import iskeyword
 import sys
 if sys.version < '3':
     import string
-    sanitise_ids = string.maketrans('#:', '__')
+    # Sanitises tokens, too
+    sanitise_ids = string.maketrans('#:{}', '____')
 else:
     sanitise_ids = {
         ord('#'): '_'
         , ord(':'): '_'
+        , ord('{'): '_'
+        , ord('}'): '_'
     }
 
-class Query(RetrievalCommand):
+class Query(RetrievalCommand, CacheMixin):
     def __init__(self, graph, entities):
         """Query against a class or a selection of its properties.
 
@@ -30,6 +33,8 @@ class Query(RetrievalCommand):
         self._graph = graph
         self._subquery = None
         self._params = {}
+        self._cacher = None # If _cacher None, no _cache, and vice versa
+        self._cache = None
 
         if not entities:
             self.source_name = None
@@ -38,7 +43,7 @@ class Query(RetrievalCommand):
 
         first_entity = entities[0]
 
-        from .what import What, LetVariable
+        from .what import What, LetVariable, QT
         from .traverse import Traverse
 
         if isinstance(first_entity, Property):
@@ -48,7 +53,6 @@ class Query(RetrievalCommand):
             # Vertex or edge instance
             self.source_name = first_entity._id
             self._class_props = tuple()
-            pass
         elif isinstance(first_entity, Query):
             # Subquery
             self._subquery = first_entity
@@ -58,7 +62,7 @@ class Query(RetrievalCommand):
             self._subquery = first_entity
             self.source_name = None
             self._class_props = tuple()
-        elif isinstance(first_entity, LetVariable):
+        elif isinstance(first_entity, (LetVariable, QT)):
             self.source_name = self.build_what(first_entity)
             self._class_props = tuple()
         elif isinstance(first_entity, What):
@@ -121,15 +125,23 @@ class Query(RetrievalCommand):
         """Get graph being queried. May be None for subqueries"""
         return self._graph
 
+    @graph.setter
+    def graph(self, graph):
+        """Set graph being queried"""
+        self._graph = graph
+
     def __iter__(self):
         params = self._params
 
         # TODO Don't ignore initial skip value
         with TempParams(params, skip='#-1:-1', limit=1):
-            optional_clauses = self.build_optional_clauses(params, None)
+            optional_clauses, command_suffix = self.build_optional_clauses(params, None)
 
             prop_names = []
-            props, lets = self.build_props(params, prop_names, for_iterator=True)
+            props, lets = self.build_props(params, prop_names)
+            if props and ('what' not in params) or prop_names:
+                # Shouldn't be prepended in the case of expand()
+                props[0:0] = ['@rid']
             if len(prop_names) > 1:
                 prop_prefix = self.source_name.translate(sanitise_ids)
 
@@ -142,20 +154,11 @@ class Query(RetrievalCommand):
             wheres = self.build_wheres(params)
 
             g = self._graph
-            cache_param = params.get('cache', None)
-            caching = cache_param is not None
-            if caching:
-                cache = cache_param[0]
-                command_suffix = (None, None, cache_param[1])
-            else:
-                cache = None
-                command_suffix = tuple()
-
+            cache = self._cache
             while True:
                 current_skip = params['skip']
-                where = u'WHERE {0}'.format(
-                    u' and '.join(
-                        [self.rid_lower(current_skip)] + wheres))
+                where = u'WHERE ' + u' and '.join(
+                        [self.rid_lower(current_skip)] + wheres)
 
                 select = self.build_select(props, lets + [where] + optional_clauses)
 
@@ -164,7 +167,7 @@ class Query(RetrievalCommand):
                     response = response[0]
 
                     if prop_names:
-                        next_skip = response.oRecordData.get('rid')
+                        next_skip = response.oRecordData.get('rid', response._rid)
                         if next_skip:
                             self.skip(next_skip)
 
@@ -215,9 +218,32 @@ class Query(RetrievalCommand):
 
     def __str__(self):
         def compiler():
-            props, lets, where, optional_clauses = self.prepare()
+            props, lets, where, optional_clauses, _ = self.prepare()
             return self.build_select(props, lets + where + optional_clauses)
         return self.compile(compiler)
+
+    def pretty(self):
+        """Pretty-print this query, to ease debugging."""
+        build_select = self.build_select
+        build_lets = self.build_lets
+        build_assign_what = self.build_assign_what
+
+        import types
+        # TODO FIXME Tweak build_pretty_* functions
+        # e.g., clearer distribution of parentheses.
+        self.build_select = types.MethodType(build_pretty_select, self)
+        self.build_lets = types.MethodType(build_pretty_lets, self)
+        self.build_assign_what = types.MethodType(build_pretty_assign_what, self)
+
+        compiled = self._compiled
+        self._compiled = None
+        prettified = str(self)
+        self._compiled = compiled
+
+        self.build_select = build_select
+        self.build_lets = build_lets
+        self.build_assign_what = build_assign_what
+        return prettified
 
     def __len__(self):
         return self.count()
@@ -247,42 +273,38 @@ class Query(RetrievalCommand):
             skip = None
         else:
             rid_clause = []
-        optional_clauses = self.build_optional_clauses(params, skip)
+        optional_clauses, command_suffix = self.build_optional_clauses(params, skip)
 
         wheres = rid_clause + self.build_wheres(params)
-        where = [u'WHERE {0}'.format(u' and '.join(wheres))] if wheres else []
+        where = [u'WHERE ' + u' and '.join(wheres)] if wheres else []
 
-        return props, lets, where, optional_clauses
+        return props, lets, where, optional_clauses, command_suffix
 
     def all(self):
         params = self._params
-        prop_names = []
         if self._compiled is not None and 'count' not in params:
-            # Must do a little extra work, for projection queries
-            self.build_props(params, prop_names)
             select = self._compiled
+            command_suffix = self.build_command_suffix(params.get('limit', None))
+            # Must do a little extra work, for projection queries
+            prop_names = self.extract_prop_names(params)
         else:
-            props, lets, where, optional_clauses = self.prepare(prop_names)
-            if len(prop_names) > 1:
-                prop_prefix = self.source_name.translate(sanitise_ids)
-
-                selectuple = namedtuple(prop_prefix + '_props',
-                    [Query.sanitise_prop_name(name)
-                        for name in prop_names])
+            prop_names = []
+            props, lets, where, optional_clauses, command_suffix = self.prepare(prop_names)
             select = self.build_select(props, lets + where + optional_clauses)
             if 'count' not in params:
                 self._compiled = select
 
-        g = self._graph
+        if len(prop_names) > 1:
+            prop_prefix = self.source_name.translate(sanitise_ids)
 
-        cache_param = params.get('cache', None)
-        caching = cache_param is not None
-        if caching:
-            response = g.client.command(select, None, None, cache_param[1])
-            cache = cache_param[0]
-        else:
-            cache = None
-            response = g.client.command(select)
+            selectuple = namedtuple(prop_prefix + '_props',
+                [Query.sanitise_prop_name(name)
+                    for name in prop_names])
+
+        g = self._graph
+        cache = self._cache
+
+        response = g.client.command(*((select,) + command_suffix))
         if response:
             # TODO Determine which other queries always take only one iteration
             list_query = 'count' not in params
@@ -333,21 +355,21 @@ class Query(RetrievalCommand):
         with TempParams(self._params, limit=2):
             responses = self.all()
             num_responses = len(responses)
-            if num_responses > 1:
-                raise MultipleResultsFound(
-                    'Expecting one result for query; got more.')
-            elif num_responses < 1:
-                raise NoResultFound('Expecting one result for query; got none.')
-            else:
+            if num_responses == 1:
                 return responses[0]
+            else:
+                if num_responses > 1:
+                    raise MultipleResultsFound(
+                        'Expecting one result for query; got more.')
+                else:
+                    raise NoResultFound('Expecting one result for query; got none.')
 
     def scalar(self):
         try:
             response = self.one()
+            return response[0] if isinstance(response, tuple) else response
         except NoResultFound:
             return None
-        else:
-            return response[0] if isinstance(response, tuple) else response
 
     def count(self, field=None):
         params = self._params
@@ -454,7 +476,7 @@ class Query(RetrievalCommand):
         """
         self.purge()
         self._params['fetch'] = plan
-        self._params['cache'] = (fetch_cache, create_cache_callback(self._graph, fetch_cache))
+        self.cache = fetch_cache
         return self
 
     def response_options(self, resolve_projections):
@@ -470,16 +492,10 @@ class Query(RetrievalCommand):
         self._params['lock'] = True
         return self
 
-    def build_props(self, params, prop_names=None, for_iterator=False):
-        let = params.get('let')
-        if let:
-            lets = ['LET {}'.format(
-                ','.join('{} = {}'.format(
-                    PropertyEncoder.encode_name(k),
-                    u'({})'.format(v) if isinstance(v, RetrievalCommand) else
-                    self.build_what(v)) for k,v in let.items()))]
-        else:
-            lets = []
+    # Internal methods, beyond this point
+
+    def build_props(self, params, prop_names=None):
+        lets = self.build_lets(params)
 
         count_field = params.get('count')
         if count_field:
@@ -504,36 +520,66 @@ class Query(RetrievalCommand):
             if prop_names is not None:
                 prop_names.extend(props)
 
-        if props and for_iterator:
-            props[0:0] = ['@rid']
-
         return props, lets
+
+    def build_assign_what(self, k, v):
+        return PropertyEncoder.encode_name(k) + u' = ' + \
+            (u'(' + str(v) + ')' if isinstance(v, RetrievalCommand) else self.build_what(v))
+
+    def build_assign_vertex(self, k, v):
+        return PropertyEncoder.encode_name(k) + u' = ' + \
+            ArgConverter.convert_to(ArgConverter.Vertex, v, self)
+
+    def build_lets(self, params):
+        let = params.get('let')
+        if let:
+            return [
+                'LET ' + ','.join(
+                    self.build_assign_what(k, v)
+                    for k,v in let.items())
+            ]
+        else:
+            return []
+
+    def extract_prop_names(self, params):
+        whats = params.get('what')
+        if whats:
+            used_names = {}
+            return [self.unique_prop_name(n, used_names)
+                        for n in (self.extract_prop_name(what) for what in whats)
+                        if n is not None]
+        else:
+            return [p.context_name() for p in self._class_props]
 
     def build_wheres(self, params):
         kw_filters = params.get('kw_filters')
-        kw_where = [u' and '.join(u'{0}={1}'
-            .format(PropertyEncoder.encode_name(k),
-                    ArgConverter.convert_to(ArgConverter.Vertex, v, self))
+        kw_where = [u' and '.join(self.build_assign_vertex(k,v)
                 for k,v in kw_filters.items())] if kw_filters else []
 
         filter_exp = params.get('filter')
         from .what import QT
         if isinstance(filter_exp, QT):
-            exp_where = ['{{{}}}'.format(filter_exp.token) if filter_exp.token is not None else '{}']
+            exp_where = ['{' + filter_exp.token + '}' if filter_exp.token is not None else '{}']
         else:
             exp_where = [self.filter_string(filter_exp)] if filter_exp else []
 
         return kw_where + exp_where
 
     def rid_lower(self, skip):
-        return '@rid > {}'.format(skip)
+        return '@rid > ' + str(skip)
 
     def build_order_expression(self, order_by):
         if isinstance(order_by, tuple):
-            return '{} {}'.format(
-                ArgConverter.convert_to(ArgConverter.Field, order_by[0], self),
-                'DESC' if order_by[1] else 'ASC')
+            return ArgConverter.convert_to(ArgConverter.Field, order_by[0], self) + \
+                    ' ' + ('DESC' if order_by[1] else 'ASC')
         return ArgConverter.convert_to(ArgConverter.Field, order_by, self)
+
+    def build_command_suffix(self, limit=None):
+        if self._cacher:
+            # TODO? Add macro to keep synchronised with default CommandMessage _limit
+            return (limit or 20, None, self._cacher)
+        else:
+            return (limit,) if limit else tuple()
 
     def build_optional_clauses(self, params, skip):
         '''LET, while being an optional clause, must precede WHERE
@@ -542,41 +588,39 @@ class Query(RetrievalCommand):
 
         group_by = params.get('group_by')
         if group_by:
-            group_clause = 'GROUP BY {}'.format(
-                ','.join([by.context_name() for by in group_by]))
+            group_clause = 'GROUP BY ' + \
+                ','.join([by.context_name() for by in group_by])
             optional_clauses.append(group_clause)
 
         order_by = params.get('order_by')
         if order_by:
-            order_clause = 'ORDER BY {0}'.format(
-                ','.join([self.build_order_expression(by) for by in order_by]))
+            order_clause = 'ORDER BY ' + \
+                ','.join([self.build_order_expression(by) for by in order_by])
             optional_clauses.append(order_clause)
 
         unwind = params.get('unwind')
         if unwind:
-           unwind_clause = 'UNWIND {}'.format(
-                    unwind.context_name()
-                    if isinstance(unwind, Property) else unwind)
+           unwind_clause = 'UNWIND ' + (unwind.context_name() if isinstance(unwind, Property) else unwind)
            optional_clauses.append(unwind_clause)
 
         if skip:
-            optional_clauses.append('SKIP {}'.format(skip))
+            optional_clauses.append('SKIP ' + str(skip))
 
-        # TODO Determine other functions for which limit is useless
-        if 'count' not in params:
+        limit = None
+        if 'count' not in params: # TODO Determine other functions for which limit is useless
             limit = params.get('limit')
             if limit:
-                optional_clauses.append('LIMIT {}'.format(limit))
+                optional_clauses.append('LIMIT ' + str(limit))
 
         fetch = params.get('fetch')
         if fetch:
-            optional_clauses.append('FETCHPLAN {}'.format(fetch))
+            optional_clauses.append('FETCHPLAN ' + fetch)
 
         lock = params.get('lock')
         if lock:
             optional_clauses.append('LOCK RECORD')
 
-        return optional_clauses
+        return optional_clauses, self.build_command_suffix(limit)
 
     @staticmethod
     def unique_prop_name(name, used_names):
@@ -601,16 +645,75 @@ class Query(RetrievalCommand):
         # This 'is not None' is important; don't want to implicitly call
         # __len__ (which invokes count()) on subquery.
         if self._subquery is not None:
-            src = u'({})'.format(self._subquery)
+            src = u'(' + str(self._subquery) + ')'
         else:
             src = self.source_name
 
         optional_string = ' '.join(optional_clauses)
         if props:
-            return u'SELECT {}{} {}'.format(
-                ','.join(props), (' FROM ' + src) if src else '', optional_string)
+            return u'SELECT ' + ','.join(props) + \
+                    ((' FROM ' + src) if src else '') + ' ' + optional_string
         else:
-            return u'SELECT FROM {} {}'.format(src, optional_string)
+            return u'SELECT FROM ' + src + ' ' + optional_string
+
+def build_pretty_select(self, props, optional_clauses):
+    query_spaces = self._params.get('indent', 0)
+    query_idt = ' ' * query_spaces
+    prop_spaces = 7 + query_spaces
+    prop_idt = ' ' * prop_spaces
+
+    clause_spaces = 4 + query_spaces
+    idt = ' ' * clause_spaces
+    new_idt = '\n' + idt
+
+    if self._subquery is not None:
+        subq = self._subquery
+        subq._params['indent'] = query_spaces + 8
+        src = u'(\n' + self._subquery.pretty() + new_idt + ')'
+    else:
+        src = self.source_name
+
+    optional_string = (new_idt).join(optional_clauses)
+    optional_string = (new_idt + optional_string if optional_string else '')
+    if props:
+        from_src = (new_idt + 'FROM ' + src) if src else ''
+        if len(props) > 1:
+            prop_divider = '\n' + prop_idt + ', '
+            return query_idt + u'SELECT ' + props[0] + prop_divider + prop_divider.join(props[1:]) + \
+                from_src + optional_string
+        else:
+            return query_idt + u'SELECT ' + props[0] + from_src + optional_string
+    else:
+        return query_idt + u'SELECT FROM ' + src + optional_string
+
+def build_pretty_lets(self, params):
+    prefix_spaces = 8 + self._params.get('indent', 0)
+    idt = ' ' * prefix_spaces
+
+    let = params.get('let')
+    if let:
+        lets = iter(let.items())
+        k, v = next(lets)
+        let_divider = '\n' + idt + ', '
+        if len(let) > 1:
+            return [
+                'LET ' + self.build_assign_what(k, v) + let_divider + let_divider.join(self.build_assign_what(k,v) for k,v in lets)
+            ]
+        else:
+            return [
+                'LET ' + self.build_assign_what(k, v)
+            ]
+    else:
+        return []
+
+def build_pretty_assign_what(self, k, v):
+    name = PropertyEncoder.encode_name(k)
+    if isinstance(v, RetrievalCommand):
+        v._params['indent'] = self._params.get('indent', 0) + len(name) + 14
+        val = u'(' + v.pretty().strip(' ') + ')'
+    else:
+        val = self.build_what(v)
+    return name + u' = ' + val
 
 class TempParams(object):
     def __init__(self, params, **kwargs):

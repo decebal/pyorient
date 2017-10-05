@@ -13,8 +13,9 @@ from pyorient.utils import STR_TYPES
 from pyorient.ogm.declarative import declarative_node, declarative_relationship
 from pyorient.ogm.property import (
     Boolean, String, Date, DateTime, Float, Decimal, Double, Integer, Short,
-    Long, EmbeddedMap, EmbeddedSet, Link, LinkList, UUID)
-from pyorient.ogm.what import expand, in_, out, outV, inV, distinct, sysdate, QV, unionall
+    Long, EmbeddedMap, EmbeddedSet, EmbeddedList, Link, LinkList, LinkMap, UUID)
+from pyorient.ogm.what import expand, in_, out, outV, inV, distinct, sysdate, QV, unionall, at_this, at_class, at_rid, any, all as traverse_all
+from pyorient.ogm.operators import instanceof, and_, or_
 
 from pyorient.ogm.update import Update
 from pyorient.ogm.sequence import Sequence, NewSequence, sequence
@@ -94,6 +95,7 @@ class OGMAnimalsTestCaseBase(unittest.TestCase):
         assert mouse == queried_mouse
         assert mouse == g.get_vertex(mouse._id)
         assert mouse == g.get_element(mouse._id)
+        self.assertEqual(mouse, Animal.from_graph(g, mouse._id, {}).load())
 
         try:
             rat2 = g.animals.create(name='rat', specie='rodent')
@@ -116,6 +118,8 @@ class OGMAnimalsTestCaseBase(unittest.TestCase):
         assert rat_eats_pea.modifier == 'lots'
         assert rat_eats_pea == g.get_edge(rat_eats_pea._id)
         assert rat_eats_pea == g.get_element(rat_eats_pea._id)
+
+        self.assertEqual(rat_eats_pea, Eats.from_graph(g, rat_eats_pea._id, None, None, {}).load())
 
         water = g.beverages.create(name='water', color='clear')
         mouse_drinks_water = g.drinks.create(mouse, water)
@@ -251,9 +255,9 @@ class Carries(MoneyRelationship):
     # No label set on relationship; Broker will not be attached to graph.
     pass
 
-class OGMMoneyTestCase(unittest.TestCase):
+class OGMValuePrecisionCase(unittest.TestCase):
     def __init__(self, *args, **kwargs):
-        super(OGMMoneyTestCase, self).__init__(*args, **kwargs)
+        super(OGMValuePrecisionCase, self).__init__(*args, **kwargs)
         self.g = None
 
     def setUp(self):
@@ -262,6 +266,18 @@ class OGMMoneyTestCase(unittest.TestCase):
 
         g.create_all(MoneyNode.registry)
         g.create_all(MoneyRelationship.registry)
+
+    def testPi(self):
+        pi = decimal.Decimal('3.1415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679821480865132823066470938446095505822317253594081284811174502841027019385211055596446229489549303819644288109756659334461284756482337867831652712019091456485669234603486104543266482133936072602491412737245870066063155881748815209209628292540917153643678925903600113305305488204665213841469519415116094330572703657595919530921861173819326117931051185480744623799627495673518857527248912279381830119491298336733624406566430860213949463952247371907021798609437027705392171762931767523846748184676694051320005681271452635608277857713427577896091736371787214684409012249534301465495853710507922796892589235420199561121290219608640344181598136297747713099605187072113499999983729780499510597317328160963185950244594553469083026425223082533446850352619311881710100031378387528865875332083814206171776691473035982534904287554687311595628638823537875937519577818577805321712268066130019278766111959092164201989')
+
+        g = self.g
+        queried = g.query(g.wallets.create(amount_imprecise=0, amount_precise=pi)).one()
+        self.assertEqual(queried.amount_precise, pi)
+
+        from pyorient.ogm.expressions import ExpressionMixin
+        expr = ExpressionMixin
+        pi_str = expr.arithmetic_string(pi)
+        self.assertEqual(decimal.Decimal(pi_str[pi_str.index('"') + 1:-2]), pi)
 
     def testDoubleSerialization(self):
         # Using str() on a float object in Python 2 sometimes
@@ -284,8 +300,8 @@ class OGMMoneyTestCase(unittest.TestCase):
                 (Wallet.amount_imprecise < (value * (1 + 1e+6)))
             ).one()
 
-            assert wallet.amount_imprecise == original_wallet.amount_imprecise
-            assert wallet.amount_precise == original_wallet.amount_precise
+            assert wallet.amount_imprecise == original_wallet.amount_imprecise == amount_imprecise
+            assert wallet.amount_precise == original_wallet.amount_precise == amount_precise
 
     def testMoney(self):
         assert len(MoneyNode.registry) == 2
@@ -369,7 +385,9 @@ class OGMMoneyTestCase(unittest.TestCase):
             assert i < 2
 
 
-        schema_registry = g.build_mapping(MoneyNode, MoneyRelationship)
+        schema_node = declarative_node()
+        schema_relationship = declarative_relationship()
+        schema_registry = g.build_mapping(schema_node, schema_relationship)
         assert all(c in schema_registry for c in ['person', 'wallet', 'carries'])
 
         WalletType = schema_registry['wallet']
@@ -434,6 +452,86 @@ class OGMSplitPropertyCase(unittest.TestCase):
             split_prop = String(nullable=False)
             A.prop = split_prop
             B.prop = split_prop
+
+class OGMFilterCase(unittest.TestCase):
+    def __init__(self, *args, **kwargs):
+        super(OGMFilterCase, self).__init__(*args, **kwargs)
+
+    def setUp(self):
+        pass
+
+    def testFilters(self):
+        from pyorient.ogm.expressions import ExpressionMixin
+        expr = ExpressionMixin
+
+        ival = Integer(name='ival')
+        eq = ival == 1
+        self.assertEqual(expr.filter_string(eq), 'ival = 1')
+
+        ge = ival >= 1
+        self.assertEqual(expr.filter_string(ge), 'ival >= 1')
+
+        gt = ival > 1
+        self.assertEqual(expr.filter_string(gt), 'ival > 1')
+
+        le = ival <= 1
+        self.assertEqual(expr.filter_string(le), 'ival <= 1')
+
+        lt = ival < 1
+        self.assertEqual(expr.filter_string(lt), 'ival < 1')
+
+        ne = ival != 1
+        self.assertEqual(expr.filter_string(ne), 'ival <> 1')
+
+        is_ = ival.is_(None)
+        self.assertEqual(expr.filter_string(is_), 'ival is null')
+
+        is_not = ival.is_not(None)
+        self.assertEqual(expr.filter_string(is_not), 'ival is not null')
+
+        between = ival.between(0, 2)
+        self.assertEqual(expr.filter_string(between), 'ival BETWEEN 0 and 2')
+
+        sval = String(name='sval')
+        self.assertEqual(expr.filter_string(sval.like('xyz')), 'sval like "xyz"')
+        self.assertEqual(expr.filter_string(sval.startswith('xyz')), 'sval like "xyz%"')
+        self.assertEqual(expr.filter_string(sval.endswith('xyz')), 'sval like "%xyz"')
+
+        simple_email_exp = '\b[\w0-9.%+-]+@[\w0-9.-]+\.[\w]{2,4}\b'
+        import json
+        self.assertEqual(expr.filter_string(sval.matches(simple_email_exp)), 'sval matches {}'.format(json.dumps(simple_email_exp)))
+
+        stringlist = EmbeddedList(name='strings', linked_to=String)
+        self.assertEqual(expr.filter_string(stringlist.contains(sval)), 'sval in strings')
+        self.assertEqual(expr.filter_string(stringlist.contains('xyz')), '"xyz" in strings')
+
+        # The declarative_* functions avoid coupling to a particular graph,
+        # and therefore avoid setting the registry_name for vertex and edge
+        # base classes. Not too much of an imposition to specify ourselves.
+        Node = declarative_node(registry_name='V')
+        self.assertEqual(expr.filter_string(at_this.instanceof(Node)), "@this instanceof 'V'")
+
+        class Foo(Node):
+            name = String()
+            value = Short()
+        self.assertEqual(expr.filter_string(at_this.instanceof(Foo)), "@this instanceof 'foo'")
+        self.assertEqual(expr.filter_string(instanceof(at_this, Foo)), "@this instanceof 'foo'")
+        self.assertEqual(expr.filter_string(at_class.instanceof(Foo)), "@class instanceof 'foo'")
+
+        foo_data = EmbeddedMap(name='foo', linked_to=Foo)
+        self.assertEqual(expr.filter_string(foo_data.contains(Foo.name=='bar')), 'foo contains (name = "bar")')
+
+        # TODO Optimise brackets added by filter_string() to preserve logic
+        cond = (Foo.name=='bar') | (Foo.name=='baz') & (Foo.value==5)
+        self.assertEqual(expr.filter_string(cond), '(name = "bar" or (name = "baz" and value = 5))')
+
+        cond = ((Foo.name=='bar') | (Foo.name=='baz')) & (Foo.value==5)
+        nonnative_prec = '((name = "bar" or name = "baz") and value = 5)'
+        self.assertEqual(expr.filter_string(cond), nonnative_prec)
+
+        # Or reverse-polish form
+        cond = and_(or_((Foo.name=='bar'), (Foo.name=='baz')), (Foo.value==5))
+        self.assertEqual(expr.filter_string(cond), nonnative_prec)
 
 class OGMArithmeticCase(unittest.TestCase):
     def __init__(self, *args, **kwargs):
@@ -547,7 +645,7 @@ class UnicodeV(UnicodeNode):
 
     name = String(nullable=False, unique=True)
     value = String(nullable=False)
-    alias = EmbeddedSet(linked_to=String(), nullable=True)
+    alias = EmbeddedSet(linked_to=String, nullable=True)
 
 
 class OGMUnicodeTestCase(unittest.TestCase):
@@ -1003,7 +1101,7 @@ class OGMTestAbstractField(unittest.TestCase):
         self.assertFalse(subclass.abstract)
         self.assertEqual(subclass.__bases__[0], abstractClass)
 
-class OGMTestSequences(unittest.TestCase):
+class OGMUpdateCase(unittest.TestCase):
     Node = declarative_node()
     class Counter(Node):
         element_plural = 'counters'
@@ -1011,39 +1109,82 @@ class OGMTestSequences(unittest.TestCase):
         name = String(nullable=False)
         value = Long(nullable=False, default=0)
 
-    class Items(Node):
+    class Item(Node):
         element_plural = 'items'
 
         id = Long(nullable=False, unique=True)
         qty = Short(nullable=False)
         price = Decimal(nullable=False)
 
+    class Bag(Node):
+        element_plural = 'bags'
+
+    Bag.flat = LinkList(linked_to=Item)
+    Bag.map = LinkMap(linked_to=Item)
+
     def __init__(self, *args, **kwargs):
-        super(OGMTestSequences, self).__init__(*args, **kwargs)
+        super(OGMUpdateCase, self).__init__(*args, **kwargs)
         self.g = None
 
     def setUp(self):
         g = self.g = Graph(Config.from_url('ogm_updates', 'root', 'root'
                                            , initial_drop=True))
 
-        g.create_all(OGMTestSequences.Node.registry)
+        g.create_all(OGMUpdateCase.Node.registry)
         self.mycounter = g.counters.create(name='mycounter')
         self.sequences = g.sequences
 
+        create_stock = g.batch()
+        create_stock['i1'] = create_stock.items.create(id=123, qty=3, price=decimal.Decimal('123.45'))
+        create_stock['i2'] = create_stock.items.create(id=456, qty=6, price=decimal.Decimal('456.78'))
+        # https://github.com/orientechnologies/orientdb/issues/7435
+        if g.server_version >= (2,2,21):
+            create_stock['bag'] = create_stock.bags.create(flat=[create_stock[:'i1'], create_stock[:'i2']], map={'i1':create_stock[:'i1'], 'i2':create_stock[:'i2']})
+        else:
+            create_stock['i_list'] = [create_stock[:'i1'], create_stock[:'i2']]
+            create_stock['bag'] = create_stock.bags.create(flat=create_stock[:'i_list'], map={'i1':create_stock[:'i1'], 'i2':create_stock[:'i2']})
+        self.bag = create_stock['$bag']
+
+    def testUpdates(self):
+        g = self.g
+
+        no_update = g.update(OGMUpdateCase.Item)
+        self.assertEqual(str(no_update), 'UPDATE item')
+
+        upserted = g.items.update().content('{"id":789, "qty":9, "price":789.01}').upsert().return_(Update.After, QV.current()).where(OGMUpdateCase.Item.id == 789).limit(1).do()
+        self.assertEqual(len(upserted), 1)
+        self.assertEqual(upserted[0].id, 789)
+        self.assertEqual(upserted[0].qty, 9)
+        self.assertEqual(upserted[0].price, decimal.Decimal('789.01'))
+
+        self.assertEqual(1, g.items.update().merge({"qty":10}).where(OGMUpdateCase.Item.id == 789).do())
+        self.assertEqual(10, g.items.query(OGMUpdateCase.Item.qty).filter(OGMUpdateCase.Item.id == 789).first())
+
+        self.assertEqual(1, g.items.update().set(("qty",11)).where(OGMUpdateCase.Item.id == 789).do())
+        self.assertEqual(11, g.items.query(OGMUpdateCase.Item.qty).filter(OGMUpdateCase.Item.id == 789).first())
+
+        bigger_bag = self.bag.update().add((OGMUpdateCase.Bag.flat, upserted[0])).put((OGMUpdateCase.Bag.map, ('i3', upserted[0]))).return_(Update.After, QV.current()).do()
+        self.assertEqual(len(bigger_bag[0].flat), 3)
+        self.assertEqual(len(bigger_bag[0].flat), len(bigger_bag[0].map))
+        self.assertEqual(bigger_bag[0].map['i3'].get_hash(), upserted[0]._id)
+
+        smaller_bag = self.bag.update().remove((OGMUpdateCase.Bag.flat, upserted[0]), (OGMUpdateCase.Bag.map, 'i3')).return_(Update.After, QV.current()).do()
+        self.assertEqual(len(smaller_bag[0].flat), 2)
+        self.assertEqual(len(smaller_bag[0].flat), len(smaller_bag[0].map))
 
     def testSequences(self):
         g = self.g
 
         # A solution to auto-incrementing ids, when sequences not available (pre-OrientDB 2.2)
-        Counter = OGMTestSequences.Counter
+        Counter = OGMUpdateCase.Counter
 
         create_first = g.batch()
-        create_first['counter'] = g.counters.update().increment((Counter.value, 1)).return_(Update.Before, QV.current()).where(Counter.name=='mycounter')
+        create_first['counter'] = g.counters.update().increment((Counter.value, 1)).return_(Update.Before, QV.current()).where(Counter.name=='mycounter').lock(Update.Default)
         create_first[:] = create_first.items.create(id=create_first[:'counter'].value[0], qty=10, price=1000)
         create_first.commit()
 
         create_second = g.batch()
-        create_second['counter'] = self.mycounter.update().increment((Counter.value, 1)).return_(Update.Before, QV.current())
+        create_second['counter'] = self.mycounter.update().increment((Counter.value, 1)).return_(Update.Before, QV.current()).lock(Update.Record).timeout(1000)
         create_second['item'] = create_second.items.create(id=create_second[:'counter'].value[0], qty=20, price=1800)
         second_item = create_second['$item']
 
@@ -1070,7 +1211,7 @@ class OGMTestSequences(unittest.TestCase):
         self.sequences.drop(seq)
 
 
-        class SequencedItem(OGMTestSequences.Node):
+        class SequencedItem(OGMUpdateCase.Node):
             element_plural = 'sequenced'
 
             item_ids = NewSequence(Sequence.Ordered, start=-1)
@@ -1235,6 +1376,7 @@ class OGMFetchPlansCase(unittest.TestCase):
             result = b.collect('ayes', 'bees', fetch='*:-1')
 
             self.assertEqual(len(result), 2)
+            ayes, bees = result.values()
             # Cache will only include the edge, now
             self.assertEqual(len(cache), 1)
             from pyorient.ogm.edge import Edge
@@ -1520,6 +1662,16 @@ class OGMTokensCase(unittest.TestCase):
         b['self'] = b.self.query()
         self.self_query = b.collect('self', 'self')
 
+        self.template_query = QT().query().what(at_class, at_rid, QV.current())
+        # So any queries formatted from this template will run against
+        # the expected graph, rather than setting per-format()
+        self.template_query.graph = g
+        # Otherwise Query will resolve element referenced by @rid attribute
+        self.template_query.response_options(resolve_projections=False)
+
+        self.template_traverse = QT().traverse(any())
+        self.template_traverse.graph = g
+
     def testTokens(self):
         g = self.g
 
@@ -1591,4 +1743,78 @@ class OGMTokensCase(unittest.TestCase):
 
         auto_callback = CompiledBatch('BEGIN\nCOMMIT', self.g, {})
         self.assertIsNotNone(auto_callback._cacher)
+
+        one_query = g.foos.query(value=1.0)
+        formatted = self.template_query.format(one_query)
+        self.assertEqual(formatted.graph, g)
+
+        one = formatted.first()
+        # '_' suffix added to python keyword 'class'
+        # 'qv_' prefix substituted automatically for '$' in '$current'/QV.current()
+        self.assertEqual(one.class_, 'foo')
+        from pyorient import OrientRecordLink
+        self.assertIsInstance(one.rid, OrientRecordLink)
+        self.assertEqual(one.rid, one.qv_current)
+
+        formatted = self.template_traverse.format(one_query)
+        self.assertEqual(formatted.graph, g)
+        one_traversed = formatted.all()
+        self.assertEqual(len(one_traversed), 2)
+
+        with self.assertRaises(ValueError) as ve:
+            QV('parent.$current')
+        print(ve.exception, '(or better yet, QV.parent_current())')
+        with self.assertRaises(ValueError) as ve:
+            QV('foo.bar')
+        print(ve.exception)
+
+class OGMPrettyCase(unittest.TestCase):
+    Node = declarative_node()
+    Relationship = declarative_relationship()
+
+    class A(Node):
+        element_plural = 'ayes'
+
+    class B(Node):
+        element_plural = 'bees'
+
+    class AB(Relationship):
+        label = 'ayebee'
+
+    def __init__(self, *args, **kwargs):
+        super(OGMPrettyCase, self).__init__(*args, **kwargs)
+        self.g = None
+
+    def setUp(self):
+        g = self.g = Graph(Config.from_url('pretty', 'root', 'root'
+                                           , initial_drop=True))
+        g.create_all(OGMPrettyCase.Node.registry)
+        g.create_all(OGMPrettyCase.Relationship.registry)
+
+        b = g.batch()
+        b['a'] = b.ayes.create()
+        b['b'] = b.bees.create()
+        b[:] = b.ayebee.create(b[:'a'], b[:'b'])
+        b.commit()
+
+    def testPretty(self):
+        g = self.g
+
+        q = g.ayes.query().what(QV.current(), QV('ab'), QV('b')).let(ab=QV.current().outE(OGMPrettyCase.AB), b=QV.current().out(OGMPrettyCase.AB))
+        compiled = str(q)
+        p = q.pretty()
+        self.assertEqual(compiled, q._compiled)
+        print(p)
+        print('\n')
+
+        from pyorient.ogm.query import Query
+        q = Query.sub(g.ayes.query().let(foo='bar', dup=g.ayes.query().let(baz='quux'))).what(QV.current())
+        print(q.pretty())
+        print('\n')
+
+        # traverse_all() in traverse() call used as an alias for pyorient.ogm.what.all(); see import line
+        q = Query.sub(g.ayes.query()).what(QV('a'), QV('t')).let(a=QV.current(), t=QV.current().traverse(traverse_all()))
+        print(q.pretty())
+        print('\n')
+
 

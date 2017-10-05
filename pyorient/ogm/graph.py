@@ -14,10 +14,13 @@ from .commands import VertexCommand, CreateEdgeCommand
 from ..utils import to_unicode
 from .sequence import Sequences
 from .mapping import MapperConfig, Decorate
+from .what import QT
 
 import pyorient
 from collections import namedtuple
 from os.path import isfile
+
+import warnings
 
 ServerVersion = namedtuple('orientdb_version', ['major', 'minor', 'build'])
 
@@ -175,9 +178,9 @@ class Graph(object):
                 prop_name = p['name']
                 # Special-case in property, mainly on edges
                 if is_edge:
-                    if p['name'] == 'in':
+                    if prop_name == 'in':
                         prop_name = 'in_'
-                    elif p['name'] == 'out':
+                    elif prop_name == 'out':
                         prop_name = 'out_'
 
                 props[prop_name] = Graph.property_from_schema(p, linked_class)
@@ -191,6 +194,21 @@ class Graph(object):
             ]
             return class_record
 
+        if auto_plural:
+            def set_vertex_props(props, class_name):
+                props['element_plural'] = class_name
+                props['registry_plural'] = class_name
+                props['element_type'] = class_name
+        else:
+            def set_vertex_props(props, class_name):
+                props['element_type'] = class_name
+
+        def set_edge_props(props, class_name):
+            props['label'] = class_name
+            props['registry_name'] = class_name
+
+        BASE_PROPS = [(set_vertex_props, False), (set_edge_props, True)]
+
         # We need to topologically sort classes, since we cannot rely on any ordering
         # in the database. In particular defaultClusterId is set to -1 for all abstract
         # classes. Additionally, superclass(es) can be changed post-create, changing the
@@ -203,16 +221,42 @@ class Graph(object):
 
         for class_def in schema:
             class_name = class_def['name']
-            props = {}
+            props = {
+                # Slightly odd construct ensures class_fields is never None
+                'class_fields': class_def.get('customFields', None) or {}
+                , 'abstract': class_def.get('abstract', False)
+            }
             # Resolve all of the base classes
             base_names = Graph.list_superclasses(class_def)
             bases = []
-            for base_name in base_names:
-                if base_name == 'V':
+            is_edge = False
+
+            if base_names:
+                base_iter = iter(base_names)
+                first_base = next(base_iter)
+
+                if first_base == 'V':
                     bases.append(vertex)
-                elif base_name == 'E':
+                    props['decl_type'] = vertex.decl_type
+                    set_base_props = set_vertex_props
+                elif first_base == 'E':
                     bases.append(edge)
+                    props['decl_type'] = edge.decl_type
+                    is_edge = True
+                    set_base_props = set_edge_props
                 else:
+                    base = resolve_class(first_base, registries)
+                    if base:
+                        bases.append(base)
+                        decl_type = base.decl_type
+                        props['decl_type'] = decl_type
+                        set_base_props, is_edge = BASE_PROPS[decl_type]
+                    else:
+                        # Worst-case scenario -- the base is not a graph type
+                        props.update(non_graph_properties.get(base_name, {}))
+                set_base_props(props, class_name)
+
+                for base_name in base_iter:
                     base = resolve_class(base_name, registries)
                     if base:
                         bases.append(base)
@@ -220,31 +264,19 @@ class Graph(object):
                         # Worst-case scenario -- the base is not a graph type
                         props.update(non_graph_properties.get(base_name, {}))
 
-            is_edge = bases and bases[0].decl_type == DeclarativeType.Edge
-            props.update(extract_properties(class_def['properties'], is_edge))
-
-            props['class_fields'] = class_def.get('customFields', None) or {}
-            props['abstract'] = class_def.get('abstract', False)
-
-            if bases:
-                # Create class for the graph type
-                props['decl_type'] = bases[0].decl_type
-
-                if is_edge:
-                    props['label'] = class_name
-                    props['registry_name'] = class_name
-                else:
-                    if auto_plural:
-                        props['element_plural'] = class_name
-                        props['registry_plural'] = class_name
-                    props['element_type'] = class_name
-
+                # Create class for the graph type.
+                definitions = registry
                 # Shouldn't always assume DeclarativeMeta metaclass when constructing the OGM class
                 # inheritance is passed through bases
-                registry[class_name] = type(bases[0])(class_name, tuple(bases), props)
+                define_class = lambda props: type(bases[0])(class_name, tuple(bases), props) 
             else:
                 # Otherwise preserve the properties in case a graph type derives from it.
-                non_graph_properties[class_name] = props
+                definitions = non_graph_properties
+                define_class = lambda props: props
+
+            props.update(extract_properties(class_def['properties'], is_edge))
+
+            definitions[class_name] = define_class(props)
 
         return registry
 
@@ -448,12 +480,11 @@ class Graph(object):
         props = sorted([(k,v) for k,v in cls.__dict__.items()
                         if isinstance(v, Property)]
                        , key=lambda p:p[1]._instance_idx)
+        guard_reserved_words = Graph.get_reserved_validator(cls)
         for prop_name, prop_value in props:
-            value_name = prop_value._name
-            if value_name:
-                prop_name = value_name
+            prop_name = prop_value._name or prop_name
 
-            Graph.guard_reserved_words(prop_name, cls)
+            guard_reserved_words(prop_name)
 
             # Special case in_ and out_ properties for edges
             if cls.decl_type == DeclarativeType.Edge:
@@ -472,16 +503,14 @@ class Graph(object):
                 # need to bypass __getattr__()
                 if type_linked_to.__dict__.get('registry_name', None):
                     linked_to = type_linked_to.registry_name
-                else:
-                    link_bases = type_linked_to.__dict__.get('__bases__', None)
-                    if link_bases and \
-                            isinstance(prop_value, LinkedProperty) and \
-                            link_bases[0] is Property:
+                elif isinstance(prop_value, LinkedProperty):
+                    link_bases = type_linked_to.__bases__
+                    if link_bases[0] is Property:
                         linked_to = type_linked_to.__name__
 
             try:
                 self.client.command(
-                    'CREATE PROPERTY {0} {1} {2}'
+                    'CREATE PROPERTY {} {} {}'
                         .format(class_prop
                                 , type(prop_value).__name__
                                 , linked_to or ''))
@@ -492,7 +521,7 @@ class Graph(object):
             if prop_value._default is not None:
                 if self.server_version >= (2,1,0):
                     self.client.command(
-                        'ALTER PROPERTY {0} DEFAULT {1}'
+                        'ALTER PROPERTY {} DEFAULT {}'
                             .format(class_prop,
                                     ArgConverter.convert_to(ArgConverter.Value,
                                                             prop_value._default,
@@ -500,7 +529,7 @@ class Graph(object):
 
             if not prop_value._nullable:
                 self.client.command(
-                        'ALTER PROPERTY {0} NOTNULL {1}'
+                        'ALTER PROPERTY {} NOTNULL {}'
                             .format(class_prop
                                     , str(not prop_value._nullable).lower()))
 
@@ -520,7 +549,7 @@ class Graph(object):
             if prop_value._indexed:
                 try:
                     self.client.command(
-                        'CREATE INDEX {0} {1}'
+                        'CREATE INDEX {} {}'
                             .format(class_prop
                                     , 'UNIQUE' if prop_value._unique
                                       else 'NOTUNIQUE'))
@@ -546,25 +575,23 @@ class Graph(object):
         """
         if ignore_instances:
             self.client.command(
-                'DROP CLASS {} UNSAFE'.format(cls.registry_name))
+                'DROP CLASS ' + cls.registry_name + ' UNSAFE')
         else:
-            self.client.command(
-                'DROP CLASS {}'.format(cls.registry_name))
+            self.client.command('DROP CLASS ' + cls.registry_name)
 
     def define_class(self, cls):
         cls_name = cls.registry_name
 
         bases = [base for base in cls.__bases__ if Graph.valid_element_base(base)]
-        if not bases:
+        try:
+            if bases[0] is bases[0].decl_root:
+                extends = ['V', 'E'][bases[0].decl_type]
+            else:
+                extends = ','.join([base.registry_name for base in bases])
+        except IndexError:
             raise TypeError(
                 'Unexpected base class(es) in Graph.create_class'
                 ' - try the declarative bases')
-
-        extends = None
-        if bases[0] is bases[0].decl_root:
-            extends = ['V', 'E'][bases[0].decl_type]
-        else:
-            extends = ','.join([base.registry_name for base in bases])
 
         #if not self.client.command(
         #    'SELECT FROM ( SELECT expand( classes ) FROM metadata:schema ) WHERE name = "{}"'
@@ -607,29 +634,20 @@ class Graph(object):
             for cls in reversed(list(reg.values())):
                 self.drop_class(cls, ignore_instances=True)
 
-    def create_vertex(self, vertex_cls, **kwargs):
+    def create_vertex(self, vertex_cls, *args, **kwargs):
         result = self.client.command(
-            to_unicode(self.create_vertex_command(vertex_cls, **kwargs)))[0]
+            to_unicode(self.create_vertex_command(vertex_cls, *args, **kwargs)))[0]
 
         props = result.oRecordData
         return vertex_cls.from_graph(self, result._rid,
                                      self.props_from_db[vertex_cls](props, None))
 
-    def create_vertex_command(self, vertex_cls, **kwargs):
+    def create_vertex_command(self, vertex_cls, *args, **kwargs):
         class_name = vertex_cls.registry_name
 
-        if kwargs:
-            db_props = Graph.props_to_db(vertex_cls, kwargs, self._strict)
-            set_clause = u' SET {}'.format(
-                u','.join(u'{}={}'.format(
-                    PropertyEncoder.encode_name(k),
-                    ArgConverter.convert_to(ArgConverter.Vertex, v, ExpressionMixin()))
-                    for k, v in db_props.items()))
-        else:
-            set_clause = u''
-
+        expressions = ExpressionMixin()
         return VertexCommand(
-            u'CREATE VERTEX {}{}'.format(class_name, set_clause))
+            u'CREATE VERTEX {}{}'.format(class_name, self.create_content_clause(vertex_cls, expressions, *args, **kwargs)))
 
     def delete_vertex(self, vertex, where = None, limit=None, batch=None):
         # TODO FIXME Parse delete result
@@ -642,52 +660,42 @@ class Graph(object):
         if where is not None:
             where_clause = ''
             if isinstance(where, dict):
-                where_clause = u' and '.join(u'{0}={1}'
+                where_clause = u' and '.join(u'{}={}'
                     .format(PropertyEncoder.encode_name(k)
                             , PropertyEncoder.encode_value(v, ExpressionMixin()))
                     for k,v in where.items())
             else:
                 where_clause = ExpressionMixin.filter_string(where)
 
-            delete_clause += ' WHERE {}'.format(where_clause)
+            delete_clause += ' WHERE ' + where_clause
         if limit is not None:
-            delete_clause += ' LIMIT {}'.format(limit)
+            delete_clause += ' LIMIT ' + str(limit)
         if batch is not None:
-            delete_clause += ' BATCH {}'.format(batch)
+            delete_clause += ' BATCH ' + str(batch)
 
         return VertexCommand(
-            u'DELETE VERTEX {}{}'.format(
-                vertex_clause, delete_clause))
+            u'DELETE VERTEX ' + vertex_clause + delete_clause)
 
-    def create_edge(self, edge_cls, from_vertex, to_vertex, **kwargs):
+    def create_edge(self, edge_cls, from_vertex, to_vertex, *args, **kwargs):
         result = self.client.command(
             to_unicode(self.create_edge_command(edge_cls
                                      , from_vertex
                                      , to_vertex
+                                     , *args
                                      , **kwargs)))[0]
 
         return self.edge_from_record(result, edge_cls)
 
-    def create_edge_command(self, edge_cls, from_vertex, to_vertex, **kwargs):
+    def create_edge_command(self, edge_cls, from_vertex, to_vertex, *args, **kwargs):
         class_name = edge_cls.registry_name
 
         expressions = ExpressionMixin()
-        if kwargs:
-            db_props = Graph.props_to_db(edge_cls, kwargs, self._strict)
-            set_clause = u' SET {}'.format(
-                u','.join(u'{}={}'.format(
-                    PropertyEncoder.encode_name(k),
-                    ArgConverter.convert_to(ArgConverter.Vertex, v, expressions))
-                    for k, v in db_props.items()))
-        else:
-            set_clause = ''
-
         return CreateEdgeCommand(
             u'CREATE EDGE {} FROM {} TO {}{}'.format(
                 class_name,
                 ArgConverter.convert_to(ArgConverter.Vertex, from_vertex, expressions),
                 ArgConverter.convert_to(ArgConverter.Vertex, to_vertex, expressions),
-                set_clause))
+                self.create_content_clause(edge_cls, expressions, *args, **kwargs)))
 
     def create_function(self, name, code, parameters=None, idempotent=False, language='javascript'):
         parameter_str = ' PARAMETERS [' + ','.join(parameters) + ']' if parameters else ''
@@ -697,16 +705,41 @@ class Graph(object):
                 name, code, parameter_str, 'true' if idempotent else 'false', language))
 
     def get_vertex(self, vertex_id):
-        record = self.client.command('SELECT FROM {}'.format(vertex_id))
-        return self.vertex_from_record(record[0]) if record else None
+        record = self.client.command('SELECT FROM ' + vertex_id)
+        try:
+            return self.vertex_from_record(record[0])
+        except:
+            return None
 
     def get_edge(self, edge_id):
-        record = self.client.command('SELECT FROM {}'.format(edge_id))
-        return self.edge_from_record(record[0]) if record else None
+        record = self.client.command('SELECT FROM ' + edge_id)
+        try:
+            return self.edge_from_record(record[0])
+        except:
+            return None
 
     def get_element(self, elem_id):
-        record = self.client.command('SELECT FROM {}'.format(elem_id))
-        return self.element_from_record(record[0]) if record else None
+        record = self.client.command('SELECT FROM ' + elem_id)
+        try:
+            return self.element_from_record(record[0])
+        except:
+            return None
+
+    def load_element(self, element_class, elem_id, cache):
+        record = self.client.command('SELECT FROM ' + elem_id)
+        try:
+            return self.props_from_db[element_class](record[0].oRecordData, cache)
+        except:
+            return {}
+
+    def load_edge(self, element_class, elem_id, cache):
+        record = self.client.command('SELECT FROM ' + elem_id)
+        try:
+            props = record[0].oRecordData
+            # Need to heed changes to in/out from UPDATE EDGE
+            return self.edge_hashes(props) + (self.props_from_db[element_class](props, cache),)
+        except:
+            return None
 
     def save_element(self, element_class, props, elem_id):
         """:return: True if successful, False otherwise"""
@@ -719,14 +752,14 @@ class Graph(object):
 
         if props:
             db_props = Graph.props_to_db(element_class, props, self._strict, skip_if='_readonly')
-            set_clause = u' SET {}'.format(
+            set_clause = u' SET ' + \
                 u','.join(u'{}={}'.format(
                     PropertyEncoder.encode_name(k), PropertyEncoder.encode_value(v, ExpressionMixin()))
-                    for k, v in db_props.items()))
+                    for k, v in db_props.items())
         else:
             set_clause = ''
 
-        result = self.client.command(u'UPDATE {}{}'.format(elem_id, set_clause))
+        result = self.client.command(u'UPDATE ' + elem_id + set_clause)
         return result and (result[0] == 1 or result[0] == b'1')
 
     def query(self, first_entity, *entities):
@@ -771,7 +804,7 @@ class Graph(object):
         :param from_: Vertex id, class, or class name
         :param edge_classes: Filter by these edges
         """
-        records = self.client.query('SELECT EXPAND( outE({0}) ) FROM {1}'
+        records = self.client.query('SELECT EXPAND( outE({}) ) FROM {}'
             .format(','.join(Graph.coerce_class_names_to_quoted(edge_classes))
                     , self.coerce_class_names(from_)), -1)
         return [self.edge_from_record(r) for r in records] \
@@ -783,7 +816,7 @@ class Graph(object):
         :param to: Vertex id, class, or class name
         :param edge_classes: Filter by these edges
         """
-        records = self.client.query('SELECT EXPAND( inE({0}) ) FROM {1}'
+        records = self.client.query('SELECT EXPAND( inE({}) ) FROM {}'
             .format(','.join(Graph.coerce_class_names_to_quoted(edge_classes))
                     , self.coerce_class_names(to)), -1)
         return [self.edge_from_record(r) for r in records] \
@@ -795,7 +828,7 @@ class Graph(object):
         :param from_to: Vertex id, class, or class name
         :param edge_classes: Filter by these edges
         """
-        records = self.client.query('SELECT EXPAND( bothE({0}) ) FROM {1}'
+        records = self.client.query('SELECT EXPAND( bothE({}) ) FROM {}'
             .format(','.join(Graph.coerce_class_names_to_quoted(edge_classes))
                     , self.coerce_class_names(from_to)), -1)
         return [self.edge_from_record(r) for r in records] \
@@ -807,7 +840,7 @@ class Graph(object):
         :param from_: Vertex id, class, or class name
         :param edge_classes: Filter by these edges
         """
-        records = self.client.query('SELECT EXPAND( out({0}) ) FROM {1}'
+        records = self.client.query('SELECT EXPAND( out({}) ) FROM {}'
             .format(','.join(Graph.coerce_class_names_to_quoted(edge_classes))
                     , self.coerce_class_names(from_)), -1)
         return [self.vertex_from_record(v) for v in records] \
@@ -819,7 +852,7 @@ class Graph(object):
         :param to: Vertex id, class, or class name
         :param edge_classes: Filter by these edges
         """
-        records = self.client.query('SELECT EXPAND( in({0}) ) FROM {1}'
+        records = self.client.query('SELECT EXPAND( in({}) ) FROM {}'
             .format(','.join(Graph.coerce_class_names_to_quoted(edge_classes))
                     , self.coerce_class_names(to)), -1)
         return [self.vertex_from_record(v) for v in records] \
@@ -831,13 +864,34 @@ class Graph(object):
         :param from_to: Vertex id, class, or class name
         :param edge_classes: Filter by these edges
         """
-        records = self.client.query('SELECT EXPAND( both({0}) )FROM {1}'
+        records = self.client.query('SELECT EXPAND( both({}) )FROM {}'
             .format(','.join(Graph.coerce_class_names_to_quoted(edge_classes))
                     , self.coerce_class_names(from_to)), -1)
         return [self.vertex_from_record(v) for v in records] \
             if records else []
 
     # The following mostly intended for internal use
+
+    def create_content_clause(self, element_cls, expressions, *args, **kwargs):
+        if args:
+            content = args[0]
+            # Problematic to accept JSON strings directly, as workflow may put
+            # this function's output through str.format()
+            if isinstance(content, QT):
+                content = expressions.build_token(content)
+            else:
+                raise TypeError("Token expected for content argument")
+            return u' CONTENT ' + content
+        elif kwargs:
+            db_props = Graph.props_to_db(element_cls, kwargs, self._strict)
+            return u' SET {}'.format(
+                u','.join(u'{}={}'.format(
+                    PropertyEncoder.encode_name(k),
+                    ArgConverter.convert_to(ArgConverter.Vertex, v, expressions))
+                    for k, v in db_props.items()))
+        else:
+            return u''
+
 
     def vertex_from_record(self, record, vertex_cls=None, cache=None):
         if not vertex_cls:
@@ -858,20 +912,9 @@ class Graph(object):
     def edge_from_record(self, record, edge_cls=None, cache=None):
         props = record.oRecordData
 
-        in_hash = None
-        in_prop = props['in']
-        # Currently it is possible to override 'in' and 'out' with custom
-        # properties, which breaks inV()/outV()
-        if type(in_prop) is pyorient.OrientRecordLink:
-            in_hash = in_prop.get_hash()
-
-        out_hash = None
-        out_prop = props['out']
-        if type(out_prop) is pyorient.OrientRecordLink:
-            out_hash = out_prop.get_hash()
-
         if not edge_cls:
             edge_cls = self.registry.get(record._class)
+        in_hash, out_hash = self.edge_hashes(props)
         return edge_cls.from_graph(self, record._rid
            , in_hash, out_hash
            , self.props_from_db[edge_cls](props, cache)
@@ -879,6 +922,14 @@ class Graph(object):
             else Edge.from_graph(self, record._rid, in_hash, out_hash,
                                  self._generic_props_mapping(props, cache),
                                  self._element_cache(cache))
+
+    def edge_hashes(self, props):
+        try:
+            in_hash, out_hash = props['in'].get_hash(), props['out'].get_hash()
+        except AttributeError:
+            return None, None
+        else:
+            return in_hash, out_hash
 
     def edges_from_records(self, records, cache=None):
         return [self.edge_from_record(record, none, cache) for record in records]
@@ -902,10 +953,13 @@ class Graph(object):
         return [self.element_from_record(record, cache) for record in records]
 
     def element_from_link(self, link, cache=None):
-        if cache:
-            cached = cache.get(link, None)
-            if cached is not None:
-                return cached
+        if cache is not None:
+            try:
+                return cache[link]
+            except KeyError:
+                warnings.warn('Cache miss on link ' + link.get_hash(), RuntimeWarning)
+        if link.is_temporary():
+            return link
         return self.get_element(link.get_hash())
 
     def elements_from_links(self, links, cache=None):
@@ -970,14 +1024,20 @@ class Graph(object):
             return False
 
     @staticmethod
-    def guard_reserved_words(word, cls):
-        reserved_words = [[],['in', 'out']][cls.decl_type]
-        if word in reserved_words:
+    def guard_reserved_words(word):
+        if word == 'in' or word == 'out':
             # Should the class also be dropped from the database?
             raise ReservedWordError(
                 "'{0}' as a property name will render"
                 " class '{1}' unusable.".format(word,
                                                 cls.registry_name))
+
+    @staticmethod
+    def get_reserved_validator(cls):
+        if cls.decl_type == DeclarativeType.Edge:
+            return Graph.guard_reserved_words
+        else:
+            return lambda word: None
 
     @staticmethod
     def create_props_mapping(db_to_element, wrapper):
@@ -1026,15 +1086,13 @@ class Graph(object):
                 props.append((m, p))
 
         props = sorted(props, key=lambda p:p[1]._instance_idx)
-        for prop_name, prop_value in props:
-            value_name = prop_value._name
-            if value_name:
-                all_properties[value_name] = prop_name
-                prop_name = value_name
-            else:
-                all_properties[prop_name] = prop_name
 
-            Graph.guard_reserved_words(prop_name, cls)
+        guard_reserved_words = Graph.get_reserved_validator(cls)
+        for prop_name, prop_value in props:
+            value_name = prop_value._name or prop_name
+            all_properties[value_name] = prop_name
+            guard_reserved_words(value_name)
+
         return all_properties
 
     @staticmethod

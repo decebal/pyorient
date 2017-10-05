@@ -11,6 +11,8 @@ from .query_utils import ArgConverter
 import re
 import string
 from copy import copy
+from collections import OrderedDict
+import sys
 
 class Batch(ExpressionMixin, CacheMixin):
     READ_COMMITTED = 0
@@ -148,7 +150,7 @@ class Batch(ExpressionMixin, CacheMixin):
                     val = self[key] = isinstance(variable, BatchQueryVariable) 
                     return val
             check = memodict().__getitem__
-            return lambda response: len(response) > 1 or check('bqv')
+            return lambda response: len(response) > 1 or returned[0] == '(' or check('bqv')
         # Before variables are cleared...
         is_query_response = memoized_query_response(self.variables) 
 
@@ -157,17 +159,14 @@ class Batch(ExpressionMixin, CacheMixin):
             command_source = CompiledBatch(str(self), g, self._cache, self._cacher)
             finalise_batch = lambda executor: command_source.set_executor(executor)
         else:
-            command_source = str(self)
             finalise_batch = lambda executor: executor(self)
-
-        self.clear()
 
         def make_batch_executor(returned, caching):
             # A notable constraint; batch is only compiled for caching if source batch has cache set
             if caching:
-                getter = lambda batch: g.client.batch(str(command_source), None, None, batch._cacher)
+                getter = lambda batch: g.client.batch(str(batch), None, None, batch._cacher)
             else:
-                getter = lambda _: g.client.batch(str(command_source))
+                getter = lambda batch: g.client.batch(str(batch))
 
             if returned:
                 if returned[0] in ('[', '{'):
@@ -188,10 +187,12 @@ class Batch(ExpressionMixin, CacheMixin):
                     getter(batch)
                 return handler
 
-        return finalise_batch(make_batch_executor(returned, self._cacher is not None))
+        finalised = finalise_batch(make_batch_executor(returned, self._cacher is not None))
+        self.clear()
+        return finalised
 
     def collect(self, *variables, **kwargs):
-        """Commit batch, collecting batch variables in a dict.
+        """Commit batch, collecting batch variables in an OrderedDict
 
         :param variables: Names of variables to collect.
         :param kwargs: 'retries', a limit for retries in event of
@@ -211,7 +212,7 @@ class Batch(ExpressionMixin, CacheMixin):
         rle = True # TODO Once OrientDB supports multiple expand()s
 
         # Ignore duplicates
-        variables = set(variables)
+        variables = OrderedDict([(v, None) for v in variables])
         if rle:
             for var in variables:
                 self.stack[-1].append('LET _{0} = SELECT ${0}.size() as size'.format(var))
@@ -237,24 +238,21 @@ class Batch(ExpressionMixin, CacheMixin):
             command_source = CompiledBatch(str(self), g, self._cache, self._cacher)
             finalise_batch = lambda executor: command_source.set_executor(executor)
         else:
-            command_source = str(self)
             finalise_batch = lambda executor: executor(self)
-
-        self.clear()
 
         # A notable constraint; batch is only compiled for caching if source batch has cache set
         if self._cacher:
-            getter = lambda batch: g.client.batch(str(command_source), None, None, batch._cacher)
+            getter = lambda batch: g.client.batch(str(batch), None, None, batch._cacher)
         else:
-            getter = lambda _: g.client.batch(str(command_source))
+            getter = lambda batch: g.client.batch(str(batch))
 
         if rle:
             def collect(batch):
                 response = getter(batch)
 
-                collected = {}
                 run_idx = 1
-                for var in variables:
+                collected = variables.copy()
+                for var in collected:
                     run_length = response[run_idx-1].oRecordData['size']
 
                     sentinel = run_idx + run_length
@@ -262,7 +260,9 @@ class Batch(ExpressionMixin, CacheMixin):
                     run_idx = sentinel + 1
                 return collected
 
-        return finalise_batch(collect)
+        finalised = finalise_batch(collect)
+        self.clear()
+        return finalised
 
     def commit(self, retries=None):
         """Commit batch with no return value.
@@ -278,17 +278,26 @@ class Batch(ExpressionMixin, CacheMixin):
             command_source = CompiledBatch(str(self), g, self._cache, self._cacher)
             finalise_batch = lambda executor: command_source.set_executor(executor, suppress_return=True)
         else:
-            command_source = str(self)
             finalise_batch = lambda executor: executor(self) and None
 
-        self.clear()
         # A notable constraint; batch is only compiled for caching if source batch has cache set
         if self._cacher:
-            execute_batch = lambda batch: g.client.batch(str(command_source), None, None, batch._cacher)
+            execute_batch = lambda batch: g.client.batch(str(batch), None, None, batch._cacher)
         else:
-            execute_batch = lambda _: g.client.batch(str(command_source))
+            execute_batch = lambda batch: g.client.batch(str(batch))
 
-        return finalise_batch(execute_batch)
+        finalised = finalise_batch(execute_batch)
+        self.clear()
+        return finalised
+
+    def return_(self, value):
+        """Add return statement to batch without committing.
+        Useful for early-out conditional logic
+
+        :param value: Return value
+        """
+        self.stack[-1].append('RETURN ' + self.return_string(value))
+        return self
 
     @staticmethod
     def return_string(variables):
@@ -299,18 +308,20 @@ class Batch(ExpressionMixin, CacheMixin):
         # '$' must be used when a variable is referenced
         if isinstance(variables, str):
             if variables[0] == '$':
-                return '{}'.format('$' + cleaned(variables[1:]))
+                return '$' + cleaned(variables[1:])
             else:
                 return repr(variables)
         elif isinstance(variables, Query):
-            return '({})'.format(variables)
+            return '(' + str(variables) + ')'
         elif isinstance(variables, (list, tuple)):
             return '[' + ','.join(
                 '$'+cleaned(var) for var in variables) + ']'
         elif isinstance(variables, dict):
             return '{' + ','.join(
-                '{}:${}'.format(repr(k),cleaned(v))
+                repr(k) + ':$' + cleaned(v)
                     for k,v in variables.items()) + '}'
+        elif isinstance(variables, LetVariable):
+            return '$' + variables._chain[0][1][0]
         else:
             return '{}'.format(variables)
 
@@ -373,6 +384,16 @@ class BatchCompiler(object):
         # Don't suppress exceptions during compile
         return False
 
+class DefaultFormat(dict):
+    def __missing__(self, key):
+        return '{' + str(key) + '}'
+default_format = DefaultFormat()
+
+if sys.version_info < (3, 2):
+    default_formatter = lambda s: string.Formatter().vformat(s, (), default_format)
+else:
+    default_formatter = lambda s: s.format_map(default_format)
+
 class CompiledBatch(RetrievalCommand, CacheMixin):
     def __init__(self, compiled, graph, cache, cacher=None):
         """Create a compiled batch
@@ -406,7 +427,8 @@ class CompiledBatch(RetrievalCommand, CacheMixin):
     def __str__(self):
         """A simplified version of format()"""
         if not self._formatted:
-            self._formatted = self._compiled.format()
+            # May contain tokens.
+            self._formatted = default_formatter(self._compiled)
         return self._formatted
 
     def set_executor(self, executor, suppress_return=False):
