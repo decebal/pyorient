@@ -15,8 +15,9 @@ addons:
 install:
 - pip install coveralls
 - pip install pyorient_native
-#- "./ci/start-ci.sh $ORIENTDB_VERSION"
 - "./ci/start-distributed.sh $ORIENTDB_VERSION"
+#- "./ci/start-ci.sh $ORIENTDB_VERSION"
+
 
 cache:
   directories:
