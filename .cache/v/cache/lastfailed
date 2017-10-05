@@ -1,0 +1,8 @@
+{
+  "tests/test_Factory_and_usage.py::CommandTestCase::test_hi_level_transaction": true,
+  "tests/test_new_Iface.py::CommandTestCase::test_transaction_new_iface": true,
+  "tests/test_ogm.py::OGMAnimalsRegistryTestCase::testGraph": true,
+  "tests/test_ogm.py::OGMAnimalsTestCaseBase::testGraph": true,
+  "tests/test_ogm.py::OGMMoneyTestCase::testMoney": true,
+  "tests/test_raw_messages_3.py::RawMessages_5_TestCase::test_transaction": true
+}
