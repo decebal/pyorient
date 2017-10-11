@@ -100,7 +100,6 @@
     <users>
         <user resources="*" password="root" name="root"/>
         <user resources="connect,server.listDatabases,server.dblist" password="guest" name="guest"/>
-        <user resources="database.passthrough" password="37AE556A1E32034047178A29FADA9AFB05064DB83489CC63FC71E68066D386D2" name="replicator"/>
     </users>
     <properties>
         <entry value="1" name="db.pool.min"/>
@@ -109,4 +108,5 @@
         <entry value="finest" name="log.console.level"/>
         <entry value="finest" name="log.file.level"/>
     </properties>
+    <isAfterFirstTime>true</isAfterFirstTime>
 </orient-server>

@@ -27,7 +27,7 @@ fi
 # ---- Start
 
 ODB_DIR="${CI_DIR}/orientdb-community-${ODB_VERSION}"
-ODB_LAUNCHER="${ODB_DIR}/bin/server.sh"
+ODB_LAUNCHER="${ODB_DIR}/bin/dserver.sh"
 
 echo "=== Initializing CI environment ==="
 

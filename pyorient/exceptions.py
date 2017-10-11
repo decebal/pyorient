@@ -2,7 +2,7 @@
 class PyOrientException(Exception):
     def __init__(self, message, errors):
 
-        _errorClass = message.split( "." )[-1]
+        _errorClass = message.split(".")[-1]
 
         x = {
             "OCommandSQLParsingException": PyOrientSQLParsingException,
@@ -12,12 +12,14 @@ class PyOrientException(Exception):
             "OSecurityAccessException": PyOrientSecurityAccessException,
             "ORecordDuplicatedException": PyOrientORecordDuplicatedException,
             "OSchemaException": PyOrientSchemaException,
-            "OIndexException": PyOrientIndexException
+            "OIndexException": PyOrientIndexException,
+            "ODistributedException": PyOrientDistributedException,
+            "ODatabaseExceptionQuorum": PyOrientDatabaseExceptionQuorum,
         }
 
         # Override the exception Type with OrientDB exception map
         if _errorClass in x.keys():
-            self.__class__ = x[ _errorClass ]
+            self.__class__ = x[_errorClass]
 
         Exception.__init__(self, message)
         # errors is an array of tuple made this way:
@@ -47,6 +49,14 @@ class PyOrientDatabaseException(PyOrientException):
     pass
 
 
+class PyOrientDistributedException(PyOrientException):
+    pass
+
+
+class PyOrientDatabaseExceptionQuorum(PyOrientDistributedException):
+    pass
+
+
 class PyOrientSQLParsingException(PyOrientException):
     pass
 
@@ -54,11 +64,14 @@ class PyOrientSQLParsingException(PyOrientException):
 class PyOrientCommandException(PyOrientException):
     pass
 
+
 class PyOrientSchemaException(PyOrientException):
     pass
 
+
 class PyOrientIndexException(PyOrientException):
     pass
+
 
 class PyOrientORecordDuplicatedException(PyOrientException):
     pass
